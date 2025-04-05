@@ -1,4 +1,5 @@
-const fs = require("fs");
+const fs = require("fs"); // Para funciones síncronas
+const fsp = require("fs").promises; // Para funciones asíncronas basadas en promesas
 const path = require("path");
 
 function deleteDir(dirPath) {
@@ -15,31 +16,23 @@ function deleteDir(dirPath) {
     if (stat.isDirectory()) {
       deleteDir(filePath);
     } else {
-      fs.unlink(filePath, () => {
-        console.log("File Deleted!");
-      });
+      fs.unlinkSync(filePath);
+      console.log("File Deleted!");
     }
   }
 
-  fs.rmdir(dirPath, () => {
-    console.log("Folder Deleted!");
-  });
+  fs.rmdirSync(dirPath);
+  console.log("Folder Deleted!");
 }
 
 async function readJsonFile(filePath) {
-  return new Promise((resolve, reject) => {
-    fs.readFile(filePath, "utf8", (err, data) => {
-      if (err) {
-        return reject(err);
-      }
-      try {
-        const jsonData = JSON.parse(data);
-        resolve(jsonData);
-      } catch (parseError) {
-        reject(parseError);
-      }
-    });
-  });
+  try {
+    const data = await fsp.readFile(filePath, "utf8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.error(`Error al leer el archivo JSON en ${filePath}:`, error);
+    throw new Error("Error al leer el archivo JSON");
+  }
 }
 
 module.exports = {
