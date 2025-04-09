@@ -1,6 +1,8 @@
 const { Router } = require("express");
   const archiver = require("archiver");
   const { MINIO_BUCKET_NAME } = require("./config.js");
+  const axios = require("axios");
+  const { Buffer } = require("buffer");
   const {
     uploadFile,
     getFiles,
@@ -262,10 +264,18 @@ const { Router } = require("express");
 
   router.post("/fileUrlW", async (req, res) => {
     try {
-      const url = await getFileURL(req.body.bucket, req.body.prefix);
-      res.json(url);
+      const fileUrl = await getFileURL(req.body.bucket, req.body.prefix);
+      
+      // Realiza una petición GET para obtener el contenido del archivo
+      const response = await axios.get(fileUrl, { responseType: "arraybuffer" });
+      
+      // Convierte la data binaria a una cadena base64
+      const base64Data = Buffer.from(response.data, "binary").toString("base64");
+      
+      res.json(base64Data);
     } catch (error) {
-      res.status(500).send("Error al obtener la ruta del archivo");
+      console.error("Error al obtener el video:", error);
+      res.status(500).send("Error al obtener el video");
     }
   });
 
@@ -390,90 +400,194 @@ const { Router } = require("express");
     }
   });
 
-  router.post("/getFoldersData", async (req, res) => {
+  router.get('/getFoldersData', async (req, res) => {
+    const { bucket, prefix, isConsultancy, routeName, user } = req.query;
+    const consultancy = isConsultancy === 'true';
+  
     try {
-      const stream = await getNameFiles(req.body.bucket, req.body.prefix);
+      // 1. Listar objetos con prefijo
+      const listRes = await s3.listObjectsV2({
+        Bucket: bucket,
+        Prefix: prefix,
+        Delimiter: '/'
+      }).promise();
+  
+      // Extraer nombres de carpetas (commonPrefixes)
+      const folders = (listRes.CommonPrefixes || []).map(cp => {
+        const parts = cp.Prefix.split('/');
+        return parts[parts.length - 2]; // penúltimo segmento
+      });
+  
+      const folderContent = {};
+      const folderThumbnail = {};
+      let filterFolderNames = consultancy ? [...folders] : [];
+  
+      // 2. Para cada carpeta, obtener info.json y thumbnail.png
+      await Promise.all(folders.map(async folderName => {
+        const infoKey = `${prefix}${folderName}/info.json`;
+        const thumbKey = `${prefix}${folderName}/thumbnail.png`;
+  
+        // Leer info.json
+        const infoObj = await s3.getObject({
+          Bucket: bucket,
+          Key: infoKey
+        }).promise();
+        const jsonData = JSON.parse(infoObj.Body.toString('utf-8'));
+  
+        // Leer thumbnail.png
+        const thumbObj = await s3.getObject({
+          Bucket: bucket,
+          Key: thumbKey
+        }).promise();
+        const base64Image = thumbObj.Body.toString('base64');
+  
+        // Filtrado si es consultancy
+        let include = true;
+        if (consultancy) {
+          if (routeName === 'Home') {
+            include = jsonData.view === 'Pública'
+              || user === jsonData.author
+              || (jsonData.collaborators || []).includes(user);
+          } else if (routeName === 'MyConsultancies') {
+            include = user === jsonData.author;
+          } else {
+            include = (jsonData.collaborators || []).includes(user);
+          }
+          if (!include) {
+            filterFolderNames = filterFolderNames.filter(f => f !== folderName);
+          }
+        }
+  
+        if (include) {
+          folderContent[folderName] = jsonData;
+          folderThumbnail[folderName] = base64Image;
+        }
+      }));
+  
+      // 3. Responder
+      res.json({
+        folderNames: consultancy ? filterFolderNames : folders,
+        folderContent,
+        folderThumbnail
+      });
+  
+    } catch (error) {
+      console.error('Error al leer los archivos S3:', error);
+      res.status(500).json({ error: 'Error al leer los archivos' });
+    }
+  });
+
+  router.post("/getFoldersDataW", async (req, res) => {
+    try {
+      const { bucket, prefix, user, routeName, isConsultancy } = req.body;
+      const consultancy = Boolean(isConsultancy);
+  
+      // 1. Listar carpetas
+      const stream = await getNameFiles(bucket, prefix);
       const folderNames = [];
       const folderContent = {};
       const folderThumbnail = {};
-      let filterFolderNames = [];
-
+  
       stream.on("data", (obj) => {
         const parts = obj.prefix.split("/");
         const folderName = parts[parts.length - 2];
-
-        folderNames.push(folderName);
-        folderContent[folderName] = [];
-        folderThumbnail[folderName] = [];
-
-        if (req.body.isConsultancy) {
-          filterFolderNames.push(folderName);
+        if (folderName && !folderNames.includes(folderName)) {
+          folderNames.push(folderName);
+          folderContent[folderName] = {};
+          folderThumbnail[folderName] = "";
         }
       });
-
+  
       stream.on("end", async () => {
+        const filteredNames = [];
+  
         for (const folderName of folderNames) {
-          const contentStream = await readFiles(
-            req.body.bucket,
-            `${req.body.prefix}${folderName}/info.json`
-          );
-          const thumbnailStream = await readFiles(
-            req.body.bucket,
-            `${req.body.prefix}${folderName}/thumbnail.png`
-          );
-          let contentData = "";
-          let imageData = [];
-
-          contentStream.on("data", (chunk) => {
-            contentData += chunk;
-          });
-
-          thumbnailStream.on("data", (chunk) => {
-            imageData.push(chunk);
-          });
-
-          await Promise.all([
-            new Promise((resolve) => contentStream.on("end", resolve)),
-            new Promise((resolve) => thumbnailStream.on("end", resolve)),
-          ]);
-
-          const jsonData = JSON.parse(contentData);
-          const base64Image = Buffer.concat(imageData).toString("base64");
-
-          if (req.body.isConsultancy) {
-            if (
-              req.body.routeName === "Home"
-                ? jsonData.view === "Pública" ||
-                  req.body.user === jsonData.author ||
-                  jsonData.collaborators.includes(req.body.user)
-                : req.body.routeName === "MyConsultancies"
-                ? req.body.user === jsonData.author
-                : jsonData.collaborators.includes(req.body.user)
-            ) {
-              folderContent[folderName] = jsonData;
-              folderThumbnail[folderName] = base64Image;
-            } else {
-              filterFolderNames = filterFolderNames.filter(
-                (filterFolderName) => filterFolderName !== folderName
-              );
-            }
-          } else {
-            folderContent[folderName] = jsonData;
-            folderThumbnail[folderName] = base64Image;
+          // --- LEER info.json ---
+          let jsonData = {};
+          try {
+            const infoStream = await readFiles(bucket, `${prefix}${folderName}/info.json`);
+            let dataStr = "";
+            infoStream.on("data", chunk => (dataStr += chunk));
+            await new Promise(r => infoStream.on("end", r));
+            jsonData = JSON.parse(dataStr);
+          } catch (err) {
+            // si no existe info.json, seguimos con jsonData vacío
           }
+  
+          // --- LEER thumbnail.png ---
+          let base64Image = "";
+          try {
+            const thumbStream = await readFiles(bucket, `${prefix}${folderName}/thumbnail.png`);
+            const chunks = [];
+            thumbStream.on("data", c => chunks.push(c));
+            await new Promise(r => thumbStream.on("end", r));
+            base64Image = Buffer.concat(chunks).toString("base64");
+          } catch (err) {
+            // sin thumbnail
+          }
+  
+          // --- FILTRADO según isConsultancy y routeName ---
+          let include = true;
+          if (consultancy) {
+            if (routeName === "/home") {
+              include = (
+                jsonData.view === "Pública" ||
+                user === jsonData.author ||
+                (Array.isArray(jsonData.collaborators) && jsonData.collaborators.includes(user))
+              );
+            } else if (routeName === "/consulties") {
+              include = user === jsonData.author;
+            } else {
+              // cualquier otra pestaña de consultoría
+              include = Array.isArray(jsonData.collaborators) && jsonData.collaborators.includes(user);
+            }
+          }
+  
+          if (!include) {
+            continue;
+          }
+          filteredNames.push(folderName);
+  
+          // --- BUSCAR si hay video en Observaciones ---
+          let hasVideo = false, videoName = "";
+          if (jsonData.nameScreen) {
+            const obsPrefix = `${prefix}${folderName}/Observaciones/${jsonData.nameScreen}/`;
+            const obsStream = await getNameFiles(bucket, obsPrefix);
+            const obsObjs = [];
+            obsStream.on("data", o => obsObjs.push(o));
+            await new Promise(r => obsStream.on("end", r));
+            for (const o of obsObjs) {
+              const lower = o.name.toLowerCase();
+              if (lower.endsWith(".mp4") || lower.endsWith(".mov")) {
+                hasVideo = true;
+                videoName = o.name.split("/").pop();
+                break;
+              }
+            }
+          }
+  
+          // --- Guardar resultado ---
+          folderContent[folderName] = {
+            ...jsonData,
+            hasVideo,
+            videoName,
+          };
+          folderThumbnail[folderName] = base64Image;
         }
-        res.json({
-          folderNames: req.body.isConsultancy ? filterFolderNames : folderNames,
+  
+        return res.json({
+          folderNames: consultancy ? filteredNames : folderNames,
           folderContent,
           folderThumbnail,
         });
       });
     } catch (error) {
+      console.error("Error en getFoldersDataw:", error);
       res.status(500).send("Error al leer los archivos");
     }
   });
 
-  router.post("/getFoldersDataW", async (req, res) => {
+  router.post("/getFoldersDataw", async (req, res) => {
     try {
       const { bucket, prefix, user } = req.body;
       const stream = await getNameFiles(bucket, prefix);
@@ -518,7 +632,7 @@ const { Router } = require("express");
           let hasVideo = false;
           let videoName = "";
           if (jsonData.nameScreen) {
-            if (!(jsonData.view === "Privada" && user !== jsonData.author)) {
+            if (!(jsonData.view === "Pública" && user !== jsonData.author)) {
               const obsPrefix = `${prefix}${folderName}/Observaciones/${jsonData.nameScreen}/`;
               const obsStream = await getNameFiles(bucket, obsPrefix);
               const obsObjects = [];
