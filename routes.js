@@ -400,82 +400,127 @@ const { Router } = require("express");
     }
   });
 
-  router.get('/getFoldersData', async (req, res) => {
-    const { bucket, prefix, isConsultancy, routeName, user } = req.query;
-    const consultancy = isConsultancy === 'true';
-  
+  router.post("/getFoldersData", async (req, res) => {
     try {
-      // 1. Listar objetos con prefijo
-      const listRes = await s3.listObjectsV2({
-        Bucket: bucket,
-        Prefix: prefix,
-        Delimiter: '/'
-      }).promise();
-  
-      // Extraer nombres de carpetas (commonPrefixes)
-      const folders = (listRes.CommonPrefixes || []).map(cp => {
-        const parts = cp.Prefix.split('/');
-        return parts[parts.length - 2]; // penúltimo segmento
-      });
-  
+      const stream = await getNameFiles(req.body.bucket, req.body.prefix);
+      const folderNames = [];
       const folderContent = {};
       const folderThumbnail = {};
-      let filterFolderNames = consultancy ? [...folders] : [];
+      let filterFolderNames = [];
   
-      // 2. Para cada carpeta, obtener info.json y thumbnail.png
-      await Promise.all(folders.map(async folderName => {
-        const infoKey = `${prefix}${folderName}/info.json`;
-        const thumbKey = `${prefix}${folderName}/thumbnail.png`;
+      stream.on("data", (obj) => {
+        const parts = obj.prefix.split("/");
+        const folderName = parts[parts.length - 2];
   
-        // Leer info.json
-        const infoObj = await s3.getObject({
-          Bucket: bucket,
-          Key: infoKey
-        }).promise();
-        const jsonData = JSON.parse(infoObj.Body.toString('utf-8'));
+        folderNames.push(folderName);
+        folderContent[folderName] = [];
+        folderThumbnail[folderName] = [];
   
-        // Leer thumbnail.png
-        const thumbObj = await s3.getObject({
-          Bucket: bucket,
-          Key: thumbKey
-        }).promise();
-        const base64Image = thumbObj.Body.toString('base64');
-  
-        // Filtrado si es consultancy
-        let include = true;
-        if (consultancy) {
-          if (routeName === 'Home') {
-            include = jsonData.view === 'Pública'
-              || user === jsonData.author
-              || (jsonData.collaborators || []).includes(user);
-          } else if (routeName === 'MyConsultancies') {
-            include = user === jsonData.author;
-          } else {
-            include = (jsonData.collaborators || []).includes(user);
-          }
-          if (!include) {
-            filterFolderNames = filterFolderNames.filter(f => f !== folderName);
-          }
+        if (req.body.isConsultancy) {
+          filterFolderNames.push(folderName);
         }
-  
-        if (include) {
-          folderContent[folderName] = jsonData;
-          folderThumbnail[folderName] = base64Image;
-        }
-      }));
-  
-      // 3. Responder
-      res.json({
-        folderNames: consultancy ? filterFolderNames : folders,
-        folderContent,
-        folderThumbnail
       });
   
+      stream.on("end", async () => {
+        for (const folderName of folderNames) {
+          const contentStream = await readFiles(
+            req.body.bucket,
+            `${req.body.prefix}${folderName}/info.json`
+          );
+          const thumbnailStream = await readFiles(
+            req.body.bucket,
+            `${req.body.prefix}${folderName}/thumbnail.png`
+          );
+          let contentData = "";
+          let imageData = [];
+  
+          contentStream.on("data", (chunk) => {
+            contentData += chunk;
+          });
+  
+          thumbnailStream.on("data", (chunk) => {
+            imageData.push(chunk);
+          });
+  
+          await Promise.all([
+            new Promise((resolve) => contentStream.on("end", resolve)),
+            new Promise((resolve) => thumbnailStream.on("end", resolve)),
+          ]);
+  
+          const jsonData = JSON.parse(contentData);
+          const base64Image = Buffer.concat(imageData).toString("base64");
+  
+          if (req.body.isConsultancy) {
+            if (
+              req.body.routeName === "Home"
+                ? jsonData.view === "Pública" ||
+                  req.body.user === jsonData.author ||
+                  jsonData.collaborators.includes(req.body.user)
+                : req.body.routeName === "MyConsultancies"
+                ? req.body.user === jsonData.author
+                : jsonData.collaborators.includes(req.body.user)
+            ) {
+              folderContent[folderName] = jsonData;
+              folderThumbnail[folderName] = base64Image;
+            } else {
+              filterFolderNames = filterFolderNames.filter(
+                (filterFolderName) => filterFolderName !== folderName
+              );
+            }
+          } else {
+            folderContent[folderName] = jsonData;
+            folderThumbnail[folderName] = base64Image;
+          }
+        }
+        res.json({
+          folderNames: req.body.isConsultancy ? filterFolderNames : folderNames,
+          folderContent,
+          folderThumbnail,
+        });
+      });
     } catch (error) {
-      console.error('Error al leer los archivos S3:', error);
-      res.status(500).json({ error: 'Error al leer los archivos' });
+      res.status(500).send("Error al leer los archivos");
     }
   });
+  
+  router.post("/files", async (req, res) => {
+    console.log("CCC");
+    try {
+      const screenJsonData = await readJsonFile(
+        req.files["json_screen"].tempFilePath
+      );
+      const consultancyJsonData = await readJsonFile(
+        req.files["json_consultancy"].tempFilePath
+      );
+      const screenName = screenJsonData.nameScreen;
+      const consultancyName = consultancyJsonData.nameConsultancy;
+      const folderPathScreen = `Consultorías TI/${consultancyName}/Observaciones/${screenName}`;
+      const folderPathConsultancy = `Consultorías TI/${consultancyName}`;
+      const thumbnailExistsInConsultancy = await checkFileExists(
+        req.body.bucket,
+        req.files["thumbnail"],
+        folderPathConsultancy
+      );
+  
+      await uploadFile(req.body.bucket, req.files["json_screen"], folderPathScreen);
+      await uploadFile(req.body.bucket, req.files["video"], folderPathScreen);
+      await uploadFile(req.body.bucket, req.files["thumbnail"], folderPathScreen);
+      await uploadFile(req.body.bucket, req.files["json_consultancy"], folderPathConsultancy);
+  
+      if (!thumbnailExistsInConsultancy) {
+        await uploadFile(req.body.bucket, req.files["thumbnail"], folderPathConsultancy);
+      }
+  
+      deleteDir("./uploads");
+  
+      res.json({ message: "upload file" });
+      console.log("upload file");
+    } catch (error) {
+      console.error("Error al procesar archivos JSON:", error);
+      return res.status(500).json({ error: "Error al procesar archivos JSON" });
+    }
+  });
+  
 
   router.post("/getFoldersDataW", async (req, res) => {
     try {
@@ -719,6 +764,25 @@ const { Router } = require("express");
       console.log("deleted file");
     } catch (error) {
       return res.status(500).send("Error al eliminar el archivo");
+    }
+  });
+
+  router.post("/deleteFileW", async (req, res) => {
+    try {
+      await deleteFile(req.body.bucket, req.body.prefix);
+      console.log("deleted file");
+      
+      // Enviar respuesta con indicador de recarga
+      res.status(200).json({
+        success: true,
+        reload: true // Bandera para indicar recarga
+      });
+      
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Error al eliminar el archivo"
+      });
     }
   });
 
